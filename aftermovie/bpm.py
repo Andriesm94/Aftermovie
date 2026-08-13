@@ -11,6 +11,6 @@ def detect_bpm(audio_path: str) -> float:
     return float(tempo)
 
 
-def beat_duration_ms(bpm: float, beats_per_clip: int = 1) -> int:
-    """Convert a BPM value into a clip duration in milliseconds."""
-    return round(60_000 / bpm * beats_per_clip)
+def beat_duration_ms(bpm: float) -> int:
+    """Convert a BPM value into the length of a single beat, in milliseconds."""
+    return round(60_000 / bpm)

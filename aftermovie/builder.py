@@ -1,4 +1,4 @@
-"""Trim a folder of short clips to a fixed beat length and stitch them together."""
+"""Trim a folder of short clips to beat-multiple lengths and stitch them together."""
 from __future__ import annotations
 
 import random
@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
+
+from .manifest import ClipSpec, load_manifest
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
@@ -20,7 +22,9 @@ def find_clips(clips_dir: Path) -> list[Path]:
 def build_aftermovie(
     clips_dir: Path,
     output_path: Path,
-    beat_ms: int,
+    unit_ms: int,
+    default_beats: int = 1,
+    manifest_path: Optional[Path] = None,
     song_path: Optional[Path] = None,
     order: str = "sequential",
     seed: Optional[int] = None,
@@ -30,7 +34,8 @@ def build_aftermovie(
     if order == "shuffle":
         random.Random(seed).shuffle(clip_paths)
 
-    beat_s = beat_ms / 1000
+    manifest = load_manifest(manifest_path) if manifest_path else {}
+
     segments = []
     skipped = []
     final = None
@@ -38,15 +43,29 @@ def build_aftermovie(
 
     try:
         for path in clip_paths:
+            spec = manifest.get(path.name, ClipSpec())
+            beats = spec.beats if spec.beats is not None else default_beats
+            length_s = (unit_ms * beats) / 1000
+
             clip = VideoFileClip(str(path))
-            if clip.duration < beat_s:
-                skipped.append(path.name)
+            if clip.duration < length_s:
+                skipped.append(
+                    f"{path.name} (needs {length_s * 1000:.0f}ms, has {clip.duration * 1000:.0f}ms)"
+                )
                 clip.close()
                 continue
-            segments.append(clip.subclip(0, beat_s))
+
+            if spec.start_ms is not None:
+                start_s = spec.start_ms / 1000
+                if start_s + length_s > clip.duration:
+                    start_s = max(0.0, clip.duration - length_s)
+            else:
+                start_s = (clip.duration - length_s) / 2  # avoid shaky clip starts/ends
+
+            segments.append(clip.subclip(start_s, start_s + length_s))
 
         if not segments:
-            raise RuntimeError(f"No clips in {clips_dir} are at least {beat_ms}ms long.")
+            raise RuntimeError(f"No clips in {clips_dir} were long enough to use.")
 
         final = concatenate_videoclips(segments, method="compose")
 
@@ -66,4 +85,4 @@ def build_aftermovie(
             final.close()
 
     if skipped:
-        print(f"Skipped {len(skipped)} clip(s) shorter than {beat_ms}ms: {', '.join(skipped)}")
+        print(f"Skipped {len(skipped)} clip(s) too short: {', '.join(skipped)}")
