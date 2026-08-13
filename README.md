@@ -1,7 +1,8 @@
-# aftermovie
+# Aftermovie
 
-Stitch a folder of short video clips into one beat-synced aftermovie. Every
-clip is trimmed to exactly `x` milliseconds, where `x` is the beat length of
+This repo is for concatenating small videos to an aftermovie. You provide a song file as well, and the video lengths are fixed to the beat of the song.
+
+Every clip is trimmed to exactly `x` milliseconds, where `x` is the beat length of
 a song (auto-detected via BPM, or set manually), then concatenated in order.
 
 ## Setup
