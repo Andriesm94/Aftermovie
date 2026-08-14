@@ -4,6 +4,7 @@ __pycache__/
 venv/
 output/
 clips/
+songs/
 *.mp4
 *.mov
 *.mp3

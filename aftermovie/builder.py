@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_audioclips, concatenate_videoclips
+from . import _moviepy_compat  # noqa: F401  (must patch moviepy before any clip is opened)
+from moviepy import AudioFileClip, VideoFileClip, concatenate_audioclips, concatenate_videoclips
 
 from .manifest import ClipSpec, load_manifest
 
@@ -104,7 +105,7 @@ def build_aftermovie(
             else:
                 start_s = (clip.duration - length_s) / 2  # avoid shaky clip starts/ends
 
-            segments.append(clip.subclip(start_s, start_s + length_s))
+            segments.append(clip.subclipped(start_s, start_s + length_s))
             song_elapsed_s[song_idx] += length_s
 
         if not segments:
@@ -114,13 +115,13 @@ def build_aftermovie(
         final = concatenate_videoclips(segments, method="compose")
 
         used_tracks = [
-            audio.subclip(0, min(elapsed, audio.duration))
+            audio.subclipped(0, min(elapsed, audio.duration))
             for audio, elapsed in zip(song_audio_clips, song_elapsed_s)
             if audio is not None and elapsed > 0
         ]
         if used_tracks:
             final_audio = used_tracks[0] if len(used_tracks) == 1 else concatenate_audioclips(used_tracks)
-            final = final.set_audio(final_audio)
+            final = final.with_audio(final_audio)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         final.write_videofile(str(output_path), fps=fps, codec="libx264", audio_codec="aac")
