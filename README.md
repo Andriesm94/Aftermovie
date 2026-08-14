@@ -37,6 +37,13 @@ python -m aftermovie.cli clips_folder output.mp4 --song song.mp3 --order shuffle
 Clips shorter than their computed length are skipped (with a warning) since
 they can't be trimmed up to that length.
 
+Mixing landscape and portrait clips? Restrict to one orientation with
+`--orientation landscape` or `--orientation portrait` (default: use both):
+
+```bash
+python -m aftermovie.cli clips_folder output.mp4 --song song.mp3 --orientation portrait
+```
+
 ## Choosing which part of each clip to use
 
 By default each clip is trimmed to the *middle* `beats-per-clip` beats, since

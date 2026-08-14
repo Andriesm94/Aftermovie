@@ -19,6 +19,14 @@ def find_clips(clips_dir: Path) -> list[Path]:
     return clips
 
 
+def clip_orientation(clip) -> str:
+    if clip.w > clip.h:
+        return "landscape"
+    if clip.h > clip.w:
+        return "portrait"
+    return "square"
+
+
 def build_aftermovie(
     clips_dir: Path,
     output_path: Path,
@@ -29,6 +37,7 @@ def build_aftermovie(
     order: str = "sequential",
     seed: Optional[int] = None,
     fps: int = 30,
+    orientation: Optional[str] = None,
 ) -> None:
     clip_paths = find_clips(clips_dir)
     if order == "shuffle":
@@ -48,6 +57,11 @@ def build_aftermovie(
             length_s = (unit_ms * beats) / 1000
 
             clip = VideoFileClip(str(path))
+
+            if orientation is not None and clip_orientation(clip) != orientation:
+                clip.close()
+                continue
+
             if clip.duration < length_s:
                 skipped.append(
                     f"{path.name} (needs {length_s * 1000:.0f}ms, has {clip.duration * 1000:.0f}ms)"
@@ -65,7 +79,8 @@ def build_aftermovie(
             segments.append(clip.subclip(start_s, start_s + length_s))
 
         if not segments:
-            raise RuntimeError(f"No clips in {clips_dir} were long enough to use.")
+            reason = f"matched orientation={orientation!r} and were long enough" if orientation else "were long enough"
+            raise RuntimeError(f"No clips in {clips_dir} {reason} to use.")
 
         final = concatenate_videoclips(segments, method="compose")
 

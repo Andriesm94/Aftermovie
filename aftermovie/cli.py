@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--order", choices=["sequential", "shuffle"], default="sequential")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for --order shuffle")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--orientation",
+        choices=["landscape", "portrait"],
+        help="Only use clips in this orientation (default: use all clips regardless of orientation)",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +67,7 @@ def main() -> None:
         order=args.order,
         seed=args.seed,
         fps=args.fps,
+        orientation=args.orientation,
     )
     print(f"Done: {args.output}")
 

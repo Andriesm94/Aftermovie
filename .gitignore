@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 output/
+clips/
 *.mp4
 *.mov
 *.mp3
