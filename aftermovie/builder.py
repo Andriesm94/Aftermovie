@@ -39,17 +39,45 @@ def clip_orientation(clip) -> str:
     return "square"
 
 
-def _group_by_orientation(
-    clip_paths: list[Path], orientations: list[str], order: str, seed: Optional[int]
-) -> list[Path]:
-    """Filter clip_paths down to the given orientations and order them group by
-    group, in the order the orientations were given (each group internally
-    shuffled if order == "shuffle")."""
-    groups: dict[str, list[Path]] = {o: [] for o in orientations}
+def _even(n: int) -> int:
+    return max(2, n - (n % 2))
+
+
+def _probe_clips(clip_paths: list[Path], skipped: list[str]) -> list[tuple[Path, str, int, int]]:
+    """Open every clip once (metadata only) to learn its orientation and size.
+    Clips that fail to open (corrupted, or the source folder syncing live via
+    OneDrive and briefly inconsistent) are logged to `skipped` and left out,
+    rather than crashing the whole build."""
+    probed = []
     for path in clip_paths:
-        clip = VideoFileClip(str(path))
-        o = clip_orientation(clip)
+        try:
+            clip = VideoFileClip(str(path))
+        except Exception as exc:
+            skipped.append(f"{path.name} (failed to open while probing: {exc})")
+            continue
+        probed.append((path, clip_orientation(clip), clip.w, clip.h))
         clip.close()
+    return probed
+
+
+def _order_clips(
+    probed: list[tuple[Path, str, int, int]],
+    orientations: Optional[list[str]],
+    order: str,
+    seed: Optional[int],
+) -> list[Path]:
+    """Either a flat (optionally shuffled) list of every probed clip, or, if
+    orientations is given, only clips matching those orientations, ordered
+    group by group in the order the orientations were given (each group
+    independently shuffled if order == "shuffle")."""
+    if not orientations:
+        clip_paths = [path for path, _, _, _ in probed]
+        if order == "shuffle":
+            random.Random(seed).shuffle(clip_paths)
+        return clip_paths
+
+    groups: dict[str, list[Path]] = {o: [] for o in orientations}
+    for path, o, _, _ in probed:
         if o in groups:
             groups[o].append(path)
 
@@ -61,23 +89,6 @@ def _group_by_orientation(
             rng.shuffle(group)
         ordered.extend(group)
     return ordered
-
-
-def _even(n: int) -> int:
-    return max(2, n - (n % 2))
-
-
-def _probe_max_size(clip_paths: list[Path]) -> tuple[int, int]:
-    """Match every clip's canvas to the largest width/height actually used,
-    so smaller clips get letterboxed onto it rather than everything being
-    forced to some unrelated fixed resolution."""
-    max_w = max_h = 0
-    for path in clip_paths:
-        clip = VideoFileClip(str(path))
-        max_w = max(max_w, clip.w)
-        max_h = max(max_h, clip.h)
-        clip.close()
-    return _even(max_w), _even(max_h)
 
 
 def _fit_to_canvas(clip, target_size: tuple[int, int]):
@@ -107,21 +118,24 @@ def build_aftermovie(
     if not songs:
         raise ValueError("At least one song (or a manual --bpm/--ms) is required.")
 
-    clip_paths = find_clips(clips_dir)
-    if orientations:
-        clip_paths = _group_by_orientation(clip_paths, orientations, order, seed)
-    elif order == "shuffle":
-        random.Random(seed).shuffle(clip_paths)
+    skipped: list[str] = []
+    probed = _probe_clips(find_clips(clips_dir), skipped)
+    clip_paths = _order_clips(probed, orientations, order, seed)
+
+    if resolution:
+        target_size = (_even(resolution[0]), _even(resolution[1]))
+    else:
+        max_w = max((w for _, _, w, _ in probed), default=0)
+        max_h = max((h for _, _, _, h in probed), default=0)
+        target_size = (_even(max_w), _even(max_h))
 
     manifest = load_manifest(manifest_path) if manifest_path else {}
-    target_size = (_even(resolution[0]), _even(resolution[1])) if resolution else _probe_max_size(clip_paths)
 
     song_audio_clips = [AudioFileClip(str(song.path)) if song.path else None for song in songs]
     song_durations = [audio.duration if audio else float("inf") for audio in song_audio_clips]
     song_elapsed_s = [0.0] * len(songs)
     song_idx = 0
     dropped = 0
-    skipped: list[str] = []
 
     try:
         with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmp_dir_str:
@@ -136,7 +150,11 @@ def build_aftermovie(
                 spec = manifest.get(path.name, ClipSpec())
                 beats = spec.beats if spec.beats is not None else default_beats
 
-                clip = VideoFileClip(str(path))
+                try:
+                    clip = VideoFileClip(str(path))
+                except Exception as exc:
+                    skipped.append(f"{path.name} (failed to open: {exc})")
+                    continue
 
                 length_s = None
                 while song_idx < len(songs):
