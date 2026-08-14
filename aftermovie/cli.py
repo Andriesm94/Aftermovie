@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 
 from .bpm import beat_duration_ms, detect_bpm
-from .builder import build_aftermovie
+from .builder import Song, build_aftermovie
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,10 +14,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("clips_dir", type=Path, help="Folder containing the short input video clips")
     parser.add_argument("output", type=Path, help="Path to write the final video to")
-    parser.add_argument("--song", type=Path, help="Song to auto-detect BPM from and use as the soundtrack")
-    parser.add_argument("--bpm", type=float, help="Manually specify BPM instead of auto-detecting")
     parser.add_argument(
-        "--ms", type=int, help="Manually specify the length of one beat in milliseconds (overrides BPM/--song)"
+        "--song",
+        type=Path,
+        action="append",
+        help="Song to auto-detect BPM from and use as the soundtrack. Repeat to queue several songs "
+        "back to back, one after another, each contributing its own beat length for the clips "
+        "that land in its slot, e.g. --song a.mp3 --song b.mp3",
+    )
+    parser.add_argument(
+        "--bpm", type=float, help="Manually specify BPM instead of auto-detecting (only when no --song is given)"
+    )
+    parser.add_argument(
+        "--ms",
+        type=int,
+        help="Manually specify the length of one beat in milliseconds (only when no --song is given)",
     )
     parser.add_argument(
         "--beats-per-clip",
@@ -44,26 +55,31 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if args.ms:
-        unit_ms = args.ms
+    if args.song:
+        if args.bpm is not None or args.ms is not None:
+            raise SystemExit("--bpm/--ms aren't supported together with --song; each song's tempo is auto-detected.")
+        songs = []
+        for path in args.song:
+            bpm = detect_bpm(str(path))
+            unit_ms = beat_duration_ms(bpm)
+            print(f"{path.name}: detected tempo {bpm:.1f} BPM -> {unit_ms} ms/beat")
+            songs.append(Song(path=path, unit_ms=unit_ms))
     else:
-        bpm = args.bpm
-        if bpm is None:
-            if args.song is None:
-                raise SystemExit("Provide --song to auto-detect BPM, or pass --bpm / --ms directly.")
-            bpm = detect_bpm(str(args.song))
-            print(f"Detected tempo: {bpm:.1f} BPM")
-        unit_ms = beat_duration_ms(bpm)
-
-    print(f"One beat = {unit_ms} ms")
+        if args.ms:
+            unit_ms = args.ms
+        elif args.bpm:
+            unit_ms = beat_duration_ms(args.bpm)
+        else:
+            raise SystemExit("Provide --song (auto-detect BPM), or pass --bpm / --ms directly.")
+        print(f"One beat = {unit_ms} ms (no soundtrack)")
+        songs = [Song(path=None, unit_ms=unit_ms)]
 
     build_aftermovie(
         clips_dir=args.clips_dir,
         output_path=args.output,
-        unit_ms=unit_ms,
+        songs=songs,
         default_beats=args.beats_per_clip,
         manifest_path=args.manifest,
-        song_path=args.song,
         order=args.order,
         seed=args.seed,
         fps=args.fps,

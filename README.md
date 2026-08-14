@@ -37,6 +37,18 @@ python -m aftermovie.cli clips_folder output.mp4 --song song.mp3 --order shuffle
 Clips shorter than their computed length are skipped (with a warning) since
 they can't be trimmed up to that length.
 
+Queue up multiple songs — once one song's runtime is used up, the next one
+kicks in with its own auto-detected tempo, so clips after the switch are cut
+to the new song's beat length:
+
+```bash
+python -m aftermovie.cli clips_folder output.mp4 --song song1.mp3 --song song2.mp3
+```
+
+If every song runs out before the clips do, the remaining trailing clips are
+dropped rather than left with silence (you'll see a note printed telling you
+how many were dropped).
+
 Mixing landscape and portrait clips? Restrict to one orientation with
 `--orientation landscape` or `--orientation portrait` (default: use both):
 
@@ -74,12 +86,13 @@ python -m aftermovie.cli clips_folder output.mp4 --song song.mp3 --manifest mani
 
 ## How it works
 
-1. `aftermovie/bpm.py` uses `librosa` to estimate the song's tempo (BPM) and
+1. `aftermovie/bpm.py` uses `librosa` to estimate each song's tempo (BPM) and
    converts it to the length of a single beat, in milliseconds.
 2. `aftermovie/manifest.py` optionally loads per-clip `start_ms`/`beats`
    overrides from a JSON file.
 3. `aftermovie/builder.py` loads each clip in the input folder with
-   `moviepy`, trims it to `[start, start + beats * unit_ms]` (defaulting to
-   the clip's middle and `--beats-per-clip`), concatenates all the trimmed
-   clips, and lays the song underneath as the audio track.
+   `moviepy`, trims it to `[start, start + beats * unit_ms]` using whichever
+   song currently has runtime left (defaulting start to the clip's middle and
+   beats to `--beats-per-clip`), concatenates all the trimmed clips, and lays
+   the matching stretch of each song underneath as the audio track.
 4. `aftermovie/cli.py` is the command-line entry point tying it together.
