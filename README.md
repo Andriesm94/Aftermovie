@@ -56,6 +56,17 @@ Mixing landscape and portrait clips? Restrict to one orientation with
 python -m aftermovie.cli clips_folder output.mp4 --song song.mp3 --orientation portrait
 ```
 
+Repeat `--orientation` to play whole orientation groups back to back instead —
+each group shuffled (or kept sequential) independently by `--order`, same
+song underneath the whole thing:
+
+```bash
+python -m aftermovie.cli clips_folder output.mp4 --song song.mp3 --order shuffle --orientation landscape --orientation portrait
+```
+
+That plays every landscape clip (shuffled among themselves) first, then
+every portrait clip (shuffled among themselves).
+
 ## Choosing which part of each clip to use
 
 By default each clip is trimmed to the *middle* `beats-per-clip` beats, since

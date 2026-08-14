@@ -47,7 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--orientation",
         choices=["landscape", "portrait"],
-        help="Only use clips in this orientation (default: use all clips regardless of orientation)",
+        action="append",
+        help="Only use clips in this orientation. Repeat to play multiple orientation groups back to back "
+        "in the order given, each group ordered independently by --order, e.g. --orientation landscape "
+        "--orientation portrait plays all landscape clips first, then all portrait clips. "
+        "(default: use all clips regardless of orientation)",
     )
     return parser.parse_args()
 
@@ -83,7 +87,7 @@ def main() -> None:
         order=args.order,
         seed=args.seed,
         fps=args.fps,
-        orientation=args.orientation,
+        orientations=args.orientation,
     )
     print(f"Done: {args.output}")
 

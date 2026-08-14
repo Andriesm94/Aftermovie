@@ -35,6 +35,30 @@ def clip_orientation(clip) -> str:
     return "square"
 
 
+def _group_by_orientation(
+    clip_paths: list[Path], orientations: list[str], order: str, seed: Optional[int]
+) -> list[Path]:
+    """Filter clip_paths down to the given orientations and order them group by
+    group, in the order the orientations were given (each group internally
+    shuffled if order == "shuffle")."""
+    groups: dict[str, list[Path]] = {o: [] for o in orientations}
+    for path in clip_paths:
+        clip = VideoFileClip(str(path))
+        o = clip_orientation(clip)
+        clip.close()
+        if o in groups:
+            groups[o].append(path)
+
+    rng = random.Random(seed)
+    ordered: list[Path] = []
+    for o in orientations:
+        group = groups[o]
+        if order == "shuffle":
+            rng.shuffle(group)
+        ordered.extend(group)
+    return ordered
+
+
 def build_aftermovie(
     clips_dir: Path,
     output_path: Path,
@@ -44,13 +68,15 @@ def build_aftermovie(
     order: str = "sequential",
     seed: Optional[int] = None,
     fps: int = 30,
-    orientation: Optional[str] = None,
+    orientations: Optional[list[str]] = None,
 ) -> None:
     if not songs:
         raise ValueError("At least one song (or a manual --bpm/--ms) is required.")
 
     clip_paths = find_clips(clips_dir)
-    if order == "shuffle":
+    if orientations:
+        clip_paths = _group_by_orientation(clip_paths, orientations, order, seed)
+    elif order == "shuffle":
         random.Random(seed).shuffle(clip_paths)
 
     manifest = load_manifest(manifest_path) if manifest_path else {}
@@ -72,10 +98,6 @@ def build_aftermovie(
             beats = spec.beats if spec.beats is not None else default_beats
 
             clip = VideoFileClip(str(path))
-
-            if orientation is not None and clip_orientation(clip) != orientation:
-                clip.close()
-                continue
 
             length_s = None
             while song_idx < len(songs):
@@ -109,7 +131,7 @@ def build_aftermovie(
             song_elapsed_s[song_idx] += length_s
 
         if not segments:
-            reason = f"matched orientation={orientation!r} and were long enough" if orientation else "were long enough"
+            reason = f"matched orientation(s) {orientations} and were long enough" if orientations else "were long enough"
             raise RuntimeError(f"No clips in {clips_dir} {reason} to use.")
 
         final = concatenate_videoclips(segments, method="compose")
