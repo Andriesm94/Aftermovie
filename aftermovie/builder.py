@@ -222,7 +222,7 @@ def build_aftermovie(
             audio_path = None
             if used_tracks:
                 final_audio = used_tracks[0] if len(used_tracks) == 1 else concatenate_audioclips(used_tracks)
-                audio_path = tmp_dir / "audio.m4a"
+                audio_path = tmp_dir / "audio.wav"  # uncompressed: no encoder-availability surprises; re-encoded to aac below
                 final_audio.write_audiofile(str(audio_path), logger=None)
 
             output_path.parent.mkdir(parents=True, exist_ok=True)
