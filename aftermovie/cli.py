@@ -8,6 +8,14 @@ from .bpm import beat_duration_ms, detect_bpm
 from .builder import Song, build_aftermovie
 
 
+def resolution(value: str) -> tuple[int, int]:
+    try:
+        w, h = value.lower().split("x")
+        return int(w), int(h)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected WIDTHxHEIGHT, e.g. 1920x1080, got {value!r}") from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Trim clips to beat-length multiples of a song and stitch them into one aftermovie."
@@ -53,6 +61,12 @@ def parse_args() -> argparse.Namespace:
         "--orientation portrait plays all landscape clips first, then all portrait clips. "
         "(default: use all clips regardless of orientation)",
     )
+    parser.add_argument(
+        "--resolution",
+        type=resolution,
+        help="Output canvas size as WIDTHxHEIGHT, e.g. 1920x1080. Clips are letterboxed/pillarboxed to fit "
+        "without cropping. Default: the largest width and largest height found among the clips actually used.",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +102,7 @@ def main() -> None:
         seed=args.seed,
         fps=args.fps,
         orientations=args.orientation,
+        resolution=args.resolution,
     )
     print(f"Done: {args.output}")
 

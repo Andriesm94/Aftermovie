@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import random
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import imageio_ffmpeg
+
 from . import _moviepy_compat  # noqa: F401  (must patch moviepy before any clip is opened)
-from moviepy import AudioFileClip, VideoFileClip, concatenate_audioclips, concatenate_videoclips
+from moviepy import AudioFileClip, CompositeVideoClip, VideoFileClip, concatenate_audioclips
 
 from .manifest import ClipSpec, load_manifest
 
@@ -59,6 +63,35 @@ def _group_by_orientation(
     return ordered
 
 
+def _even(n: int) -> int:
+    return max(2, n - (n % 2))
+
+
+def _probe_max_size(clip_paths: list[Path]) -> tuple[int, int]:
+    """Match every clip's canvas to the largest width/height actually used,
+    so smaller clips get letterboxed onto it rather than everything being
+    forced to some unrelated fixed resolution."""
+    max_w = max_h = 0
+    for path in clip_paths:
+        clip = VideoFileClip(str(path))
+        max_w = max(max_w, clip.w)
+        max_h = max(max_h, clip.h)
+        clip.close()
+    return _even(max_w), _even(max_h)
+
+
+def _fit_to_canvas(clip, target_size: tuple[int, int]):
+    """Scale clip to fit inside target_size preserving aspect ratio, then
+    center it on a black canvas of exactly target_size (letterbox/pillarbox)."""
+    target_w, target_h = target_size
+    if clip.w / clip.h > target_w / target_h:
+        resized = clip.resized(width=target_w)
+    else:
+        resized = clip.resized(height=target_h)
+    resized = resized.with_position("center")
+    return CompositeVideoClip([resized], size=target_size, bg_color=(0, 0, 0))
+
+
 def build_aftermovie(
     clips_dir: Path,
     output_path: Path,
@@ -69,6 +102,7 @@ def build_aftermovie(
     seed: Optional[int] = None,
     fps: int = 30,
     orientations: Optional[list[str]] = None,
+    resolution: Optional[tuple[int, int]] = None,
 ) -> None:
     if not songs:
         raise ValueError("At least one song (or a manual --bpm/--ms) is required.")
@@ -80,81 +114,119 @@ def build_aftermovie(
         random.Random(seed).shuffle(clip_paths)
 
     manifest = load_manifest(manifest_path) if manifest_path else {}
-
-    segments = []
-    skipped = []
-    final = None
-    final_audio = None
+    target_size = (_even(resolution[0]), _even(resolution[1])) if resolution else _probe_max_size(clip_paths)
 
     song_audio_clips = [AudioFileClip(str(song.path)) if song.path else None for song in songs]
     song_durations = [audio.duration if audio else float("inf") for audio in song_audio_clips]
     song_elapsed_s = [0.0] * len(songs)
     song_idx = 0
     dropped = 0
+    skipped: list[str] = []
 
     try:
-        for i, path in enumerate(clip_paths):
-            spec = manifest.get(path.name, ClipSpec())
-            beats = spec.beats if spec.beats is not None else default_beats
+        with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            segment_paths: list[Path] = []
 
-            clip = VideoFileClip(str(path))
+            # Render each clip's trimmed segment to its own small temp file and
+            # close the source clip right away, instead of keeping every clip's
+            # ffmpeg reader open at once for the whole build (that stops scaling
+            # once there are more than a couple dozen clips).
+            for i, path in enumerate(clip_paths):
+                spec = manifest.get(path.name, ClipSpec())
+                beats = spec.beats if spec.beats is not None else default_beats
 
-            length_s = None
-            while song_idx < len(songs):
-                candidate_length_s = (songs[song_idx].unit_ms * beats) / 1000
-                remaining_s = song_durations[song_idx] - song_elapsed_s[song_idx]
-                if candidate_length_s <= remaining_s:
-                    length_s = candidate_length_s
-                    break
-                song_idx += 1
+                clip = VideoFileClip(str(path))
 
-            if length_s is None:
-                clip.close()
-                dropped = len(clip_paths) - i
-                break  # every song's runtime is spoken for; nothing more fits
+                length_s = None
+                while song_idx < len(songs):
+                    candidate_length_s = (songs[song_idx].unit_ms * beats) / 1000
+                    remaining_s = song_durations[song_idx] - song_elapsed_s[song_idx]
+                    if candidate_length_s <= remaining_s:
+                        length_s = candidate_length_s
+                        break
+                    song_idx += 1
 
-            if clip.duration < length_s:
-                skipped.append(
-                    f"{path.name} (needs {length_s * 1000:.0f}ms, has {clip.duration * 1000:.0f}ms)"
+                if length_s is None:
+                    clip.close()
+                    dropped = len(clip_paths) - i
+                    break  # every song's runtime is spoken for; nothing more fits
+
+                if clip.duration < length_s:
+                    skipped.append(
+                        f"{path.name} (needs {length_s * 1000:.0f}ms, has {clip.duration * 1000:.0f}ms)"
+                    )
+                    clip.close()
+                    continue
+
+                if spec.start_ms is not None:
+                    start_s = spec.start_ms / 1000
+                    if start_s + length_s > clip.duration:
+                        start_s = max(0.0, clip.duration - length_s)
+                else:
+                    start_s = (clip.duration - length_s) / 2  # avoid shaky clip starts/ends
+
+                seg_path = tmp_dir / f"seg_{len(segment_paths):05d}.mp4"
+                rendered = False
+                try:
+                    sub = clip.subclipped(start_s, start_s + length_s)
+                    fitted = _fit_to_canvas(sub, target_size)
+                    fitted.write_videofile(str(seg_path), fps=fps, codec="libx264", audio=False, logger=None)
+                    rendered = True
+                except Exception as exc:
+                    skipped.append(f"{path.name} (failed to render at {start_s:.2f}s: {exc})")
+                finally:
+                    clip.close()
+
+                if not rendered:
+                    continue
+
+                segment_paths.append(seg_path)
+                song_elapsed_s[song_idx] += length_s
+
+            if not segment_paths:
+                reason = (
+                    f"matched orientation(s) {orientations} and were long enough" if orientations else "were long enough"
                 )
-                clip.close()
-                continue
+                raise RuntimeError(f"No clips in {clips_dir} {reason} to use.")
 
-            if spec.start_ms is not None:
-                start_s = spec.start_ms / 1000
-                if start_s + length_s > clip.duration:
-                    start_s = max(0.0, clip.duration - length_s)
+            list_path = tmp_dir / "concat_list.txt"
+            with open(list_path, "w", encoding="utf-8") as f:
+                for seg_path in segment_paths:
+                    escaped = str(seg_path).replace("\\", "/").replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+
+            used_tracks = [
+                audio.subclipped(0, min(elapsed, audio.duration))
+                for audio, elapsed in zip(song_audio_clips, song_elapsed_s)
+                if audio is not None and elapsed > 0
+            ]
+            audio_path = None
+            if used_tracks:
+                final_audio = used_tracks[0] if len(used_tracks) == 1 else concatenate_audioclips(used_tracks)
+                audio_path = tmp_dir / "audio.m4a"
+                final_audio.write_audiofile(str(audio_path), logger=None)
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            cmd = [ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
+            if audio_path is not None:
+                cmd += [
+                    "-i", str(audio_path),
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-shortest",
+                ]
             else:
-                start_s = (clip.duration - length_s) / 2  # avoid shaky clip starts/ends
+                cmd += ["-map", "0:v:0", "-c:v", "copy"]
+            cmd += [str(output_path)]
 
-            segments.append(clip.subclipped(start_s, start_s + length_s))
-            song_elapsed_s[song_idx] += length_s
-
-        if not segments:
-            reason = f"matched orientation(s) {orientations} and were long enough" if orientations else "were long enough"
-            raise RuntimeError(f"No clips in {clips_dir} {reason} to use.")
-
-        final = concatenate_videoclips(segments, method="compose")
-
-        used_tracks = [
-            audio.subclipped(0, min(elapsed, audio.duration))
-            for audio, elapsed in zip(song_audio_clips, song_elapsed_s)
-            if audio is not None and elapsed > 0
-        ]
-        if used_tracks:
-            final_audio = used_tracks[0] if len(used_tracks) == 1 else concatenate_audioclips(used_tracks)
-            final = final.with_audio(final_audio)
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        final.write_videofile(str(output_path), fps=fps, codec="libx264", audio_codec="aac")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed to join segments:\n{result.stderr[-4000:]}")
     finally:
-        for clip in segments:
-            clip.close()
         for audio in song_audio_clips:
             if audio is not None:
                 audio.close()
-        if final is not None:
-            final.close()
 
     unused_songs = [
         song.path.name for song, elapsed in zip(songs, song_elapsed_s) if song.path and elapsed == 0
@@ -164,4 +236,4 @@ def build_aftermovie(
     if dropped:
         print(f"Note: dropped {dropped} trailing clip(s) — ran out of song runtime")
     if skipped:
-        print(f"Skipped {len(skipped)} clip(s) too short: {', '.join(skipped)}")
+        print(f"Skipped {len(skipped)} clip(s): {', '.join(skipped)}")
