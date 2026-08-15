@@ -5,6 +5,7 @@ venv/
 output/
 clips/
 songs/
+manifest.json
 *.mp4
 *.mov
 *.mp3
