@@ -65,29 +65,34 @@ def _order_clips(
     orientations: Optional[list[str]],
     order: str,
     seed: Optional[int],
+    manifest_order: Optional[dict[str, int]] = None,
 ) -> list[Path]:
-    """Either a flat (optionally shuffled) list of every probed clip, or, if
-    orientations is given, only clips matching those orientations, ordered
-    group by group in the order the orientations were given (each group
-    independently shuffled if order == "shuffle")."""
-    if not orientations:
-        clip_paths = [path for path, _, _, _ in probed]
+    """Either a flat (optionally shuffled/manifest-ordered) list of every
+    probed clip, or, if orientations is given, only clips matching those
+    orientations, ordered group by group in the order the orientations were
+    given (each group independently arranged per `order`)."""
+    rng = random.Random(seed)
+
+    def arrange(paths: list[Path]) -> list[Path]:
         if order == "shuffle":
-            random.Random(seed).shuffle(clip_paths)
-        return clip_paths
+            paths = paths[:]
+            rng.shuffle(paths)
+            return paths
+        if order == "manifest":
+            return sorted(paths, key=lambda p: manifest_order.get(p.name, len(manifest_order)))
+        return paths  # sequential: already alphabetical, courtesy of find_clips()
+
+    if not orientations:
+        return arrange([path for path, _, _, _ in probed])
 
     groups: dict[str, list[Path]] = {o: [] for o in orientations}
     for path, o, _, _ in probed:
         if o in groups:
             groups[o].append(path)
 
-    rng = random.Random(seed)
     ordered: list[Path] = []
     for o in orientations:
-        group = groups[o]
-        if order == "shuffle":
-            rng.shuffle(group)
-        ordered.extend(group)
+        ordered.extend(arrange(groups[o]))
     return ordered
 
 
@@ -117,10 +122,15 @@ def build_aftermovie(
 ) -> None:
     if not songs:
         raise ValueError("At least one song (or a manual --bpm/--ms) is required.")
+    if order == "manifest" and not manifest_path:
+        raise ValueError("order='manifest' requires a manifest_path.")
+
+    manifest = load_manifest(manifest_path) if manifest_path else {}
+    manifest_order = {name: idx for idx, name in enumerate(manifest.keys())}
 
     skipped: list[str] = []
     probed = _probe_clips(find_clips(clips_dir), skipped)
-    clip_paths = _order_clips(probed, orientations, order, seed)
+    clip_paths = _order_clips(probed, orientations, order, seed, manifest_order)
 
     if resolution:
         target_size = (_even(resolution[0]), _even(resolution[1]))
@@ -128,8 +138,6 @@ def build_aftermovie(
         max_w = max((w for _, _, w, _ in probed), default=0)
         max_h = max((h for _, _, _, h in probed), default=0)
         target_size = (_even(max_w), _even(max_h))
-
-    manifest = load_manifest(manifest_path) if manifest_path else {}
 
     song_audio_clips = [AudioFileClip(str(song.path)) if song.path else None for song in songs]
     song_durations = [audio.duration if audio else float("inf") for audio in song_audio_clips]

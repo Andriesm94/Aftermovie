@@ -49,7 +49,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="JSON file with per-clip {start_ms, beats} overrides, e.g. manifest.example.json",
     )
-    parser.add_argument("--order", choices=["sequential", "shuffle"], default="sequential")
+    parser.add_argument(
+        "--order",
+        choices=["sequential", "shuffle", "manifest"],
+        default="sequential",
+        help="'manifest' plays clips in the order they're listed as keys in --manifest (which is then "
+        "required); clips not listed in the manifest are appended afterward, alphabetically.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for --order shuffle")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
