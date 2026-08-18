@@ -135,8 +135,14 @@ def build_aftermovie(
     if resolution:
         target_size = (_even(resolution[0]), _even(resolution[1]))
     else:
-        max_w = max((w for _, _, w, _ in probed), default=0)
-        max_h = max((h for _, _, _, h in probed), default=0)
+        # Size the canvas from only the clips actually selected (post
+        # orientation-filtering) rather than every clip in the folder -
+        # otherwise e.g. an all-portrait build gets sized against landscape
+        # clips it never uses and everything ends up pillarboxed tiny.
+        dims = {path: (w, h) for path, _, w, h in probed}
+        used_dims = [dims[p] for p in clip_paths if p in dims]
+        max_w = max((w for w, _ in used_dims), default=0)
+        max_h = max((h for _, h in used_dims), default=0)
         target_size = (_even(max_w), _even(max_h))
 
     song_audio_clips = [AudioFileClip(str(song.path)) if song.path else None for song in songs]
