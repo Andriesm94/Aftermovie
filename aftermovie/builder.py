@@ -6,7 +6,6 @@ import json
 import random
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -203,126 +202,127 @@ def build_aftermovie(
     dropped = 0
 
     try:
-        with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmp_dir_str:
-            tmp_dir = Path(tmp_dir_str)
-            segment_paths: list[Path] = []
+        segment_paths: list[Path] = []
 
-            # Render each clip's trimmed segment in its own subprocess (see
-            # _clip_worker.py) and only keep the small file - never hold a
-            # clip's ffmpeg reader open in this process, and never let one
-            # clip's crash take the whole build down. Segments are written
-            # into the persistent cache_dir (not tmp_dir) under a name keyed
-            # by exactly what produced them, so a segment already rendered by
-            # an earlier, interrupted attempt at this same build is reused
-            # instead of redone.
-            for i, path in enumerate(clip_paths):
-                spec = manifest.get(path.name, ClipSpec())
-                beats = spec.beats if spec.beats is not None else default_beats
-                duration = durations[path]
+        # Render each clip's trimmed segment in its own subprocess (see
+        # _clip_worker.py) and only keep the small file - never hold a
+        # clip's ffmpeg reader open in this process, and never let one
+        # clip's crash take the whole build down. Segments are written into
+        # the persistent cache_dir under a name keyed by exactly what
+        # produced them, so a segment already rendered by an earlier,
+        # interrupted attempt at this same build is reused instead of redone.
+        for i, path in enumerate(clip_paths):
+            spec = manifest.get(path.name, ClipSpec())
+            beats = spec.beats if spec.beats is not None else default_beats
+            duration = durations[path]
 
-                length_s = None
-                while song_idx < len(songs):
-                    candidate_length_s = (songs[song_idx].unit_ms * beats) / 1000
-                    remaining_s = song_durations[song_idx] - song_elapsed_s[song_idx]
-                    if candidate_length_s <= remaining_s:
-                        length_s = candidate_length_s
-                        break
-                    song_idx += 1
+            length_s = None
+            while song_idx < len(songs):
+                candidate_length_s = (songs[song_idx].unit_ms * beats) / 1000
+                remaining_s = song_durations[song_idx] - song_elapsed_s[song_idx]
+                if candidate_length_s <= remaining_s:
+                    length_s = candidate_length_s
+                    break
+                song_idx += 1
 
-                if length_s is None:
-                    dropped = len(clip_paths) - i
-                    break  # every song's runtime is spoken for; nothing more fits
+            if length_s is None:
+                dropped = len(clip_paths) - i
+                break  # every song's runtime is spoken for; nothing more fits
 
-                if duration < length_s:
-                    skipped.append(
-                        f"{path.name} (needs {length_s * 1000:.0f}ms, has {duration * 1000:.0f}ms)"
-                    )
-                    continue
-
-                if spec.start_ms is not None:
-                    start_s = spec.start_ms / 1000
-                    if start_s + length_s > duration:
-                        start_s = max(0.0, duration - length_s)
-                else:
-                    start_s = (duration - length_s) / 2  # avoid shaky clip starts/ends
-
-                seg_key = hashlib.sha1(
-                    f"{path.name}|{_file_fingerprint(path)}|{start_s:.3f}|{length_s:.3f}|"
-                    f"{target_size[0]}x{target_size[1]}|{fps}".encode()
-                ).hexdigest()[:20]
-                seg_path = cache_dir / f"seg_{seg_key}.mp4"
-
-                if seg_path.exists():
-                    rendered = True
-                else:
-                    rendered = False
-                    try:
-                        result = _run_worker(
-                            [
-                                "render",
-                                str(path),
-                                str(start_s),
-                                str(length_s),
-                                str(target_size[0]),
-                                str(target_size[1]),
-                                str(fps),
-                                str(seg_path),
-                            ],
-                            timeout=RENDER_TIMEOUT_S,
-                        )
-                        rendered = result.returncode == 0 and seg_path.exists()
-                        if not rendered:
-                            skipped.append(
-                                f"{path.name} (failed to render at {start_s:.2f}s: {_failure_reason(result)})"
-                            )
-                    except subprocess.TimeoutExpired:
-                        skipped.append(f"{path.name} (timed out while rendering)")
-
-                if not rendered:
-                    continue
-
-                segment_paths.append(seg_path)
-                song_elapsed_s[song_idx] += length_s
-
-            if not segment_paths:
-                reason = (
-                    f"matched orientation(s) {orientations} and were long enough" if orientations else "were long enough"
+            if duration < length_s:
+                skipped.append(
+                    f"{path.name} (needs {length_s * 1000:.0f}ms, has {duration * 1000:.0f}ms)"
                 )
-                raise RuntimeError(f"No clips in {clips_dir} {reason} to use.")
+                continue
 
-            list_path = tmp_dir / "concat_list.txt"
-            with open(list_path, "w", encoding="utf-8") as f:
-                for seg_path in segment_paths:
-                    escaped = str(seg_path).replace("\\", "/").replace("'", "'\\''")
-                    f.write(f"file '{escaped}'\n")
-
-            used_tracks = [
-                audio.subclipped(0, min(elapsed, audio.duration))
-                for audio, elapsed in zip(song_audio_clips, song_elapsed_s)
-                if audio is not None and elapsed > 0
-            ]
-            audio_path = None
-            if used_tracks:
-                final_audio = used_tracks[0] if len(used_tracks) == 1 else concatenate_audioclips(used_tracks)
-                audio_path = tmp_dir / "audio.wav"  # uncompressed: no encoder-availability surprises; re-encoded to aac below
-                final_audio.write_audiofile(str(audio_path), logger=None)
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            cmd = [ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
-            if audio_path is not None:
-                cmd += [
-                    "-i", str(audio_path),
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-c:v", "copy", "-c:a", "aac", "-shortest",
-                ]
+            if spec.start_ms is not None:
+                start_s = spec.start_ms / 1000
+                if start_s + length_s > duration:
+                    start_s = max(0.0, duration - length_s)
             else:
-                cmd += ["-map", "0:v:0", "-c:v", "copy"]
-            cmd += [str(output_path)]
+                start_s = (duration - length_s) / 2  # avoid shaky clip starts/ends
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed to join segments:\n{result.stderr[-4000:]}")
+            seg_key = hashlib.sha1(
+                f"{path.name}|{_file_fingerprint(path)}|{start_s:.3f}|{length_s:.3f}|"
+                f"{target_size[0]}x{target_size[1]}|{fps}".encode()
+            ).hexdigest()[:20]
+            seg_path = cache_dir / f"seg_{seg_key}.mp4"
+
+            if seg_path.exists():
+                rendered = True
+            else:
+                rendered = False
+                try:
+                    result = _run_worker(
+                        [
+                            "render",
+                            str(path),
+                            str(start_s),
+                            str(length_s),
+                            str(target_size[0]),
+                            str(target_size[1]),
+                            str(fps),
+                            str(seg_path),
+                        ],
+                        timeout=RENDER_TIMEOUT_S,
+                    )
+                    rendered = result.returncode == 0 and seg_path.exists()
+                    if not rendered:
+                        skipped.append(
+                            f"{path.name} (failed to render at {start_s:.2f}s: {_failure_reason(result)})"
+                        )
+                except subprocess.TimeoutExpired:
+                    skipped.append(f"{path.name} (timed out while rendering)")
+
+            if not rendered:
+                continue
+
+            segment_paths.append(seg_path)
+            song_elapsed_s[song_idx] += length_s
+
+        if not segment_paths:
+            reason = (
+                f"matched orientation(s) {orientations} and were long enough" if orientations else "were long enough"
+            )
+            raise RuntimeError(f"No clips in {clips_dir} {reason} to use.")
+
+        # concat_list.txt and audio.wav live in cache_dir (inside the project,
+        # not the OS temp dir) - deep OS temp dirs turned out to be an
+        # unreliable place to stage files right before ffmpeg reads them on
+        # this machine, for whatever external reason.
+        list_path = cache_dir / "concat_list.txt"
+        with open(list_path, "w", encoding="utf-8") as f:
+            for seg_path in segment_paths:
+                escaped = str(seg_path).replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
+        used_tracks = [
+            audio.subclipped(0, min(elapsed, audio.duration))
+            for audio, elapsed in zip(song_audio_clips, song_elapsed_s)
+            if audio is not None and elapsed > 0
+        ]
+        audio_path = None
+        if used_tracks:
+            final_audio = used_tracks[0] if len(used_tracks) == 1 else concatenate_audioclips(used_tracks)
+            audio_path = cache_dir / "audio.wav"  # uncompressed: no encoder-availability surprises; re-encoded to aac below
+            final_audio.write_audiofile(str(audio_path), logger=None)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
+        if audio_path is not None:
+            cmd += [
+                "-i", str(audio_path),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-shortest",
+            ]
+        else:
+            cmd += ["-map", "0:v:0", "-c:v", "copy"]
+        cmd += [str(output_path)]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed to join segments:\n{result.stderr[-4000:]}")
     finally:
         for audio in song_audio_clips:
             if audio is not None:
