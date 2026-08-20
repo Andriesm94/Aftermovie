@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import random
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,11 +12,13 @@ from typing import Optional
 import imageio_ffmpeg
 
 from . import _moviepy_compat  # noqa: F401  (must patch moviepy before any clip is opened)
-from moviepy import AudioFileClip, CompositeVideoClip, VideoFileClip, concatenate_audioclips
+from moviepy import AudioFileClip, concatenate_audioclips
 
 from .manifest import ClipSpec, load_manifest
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+PROBE_TIMEOUT_S = 60
+RENDER_TIMEOUT_S = 300
 
 
 @dataclass
@@ -31,37 +34,47 @@ def find_clips(clips_dir: Path) -> list[Path]:
     return clips
 
 
-def clip_orientation(clip) -> str:
-    if clip.w > clip.h:
-        return "landscape"
-    if clip.h > clip.w:
-        return "portrait"
-    return "square"
+def _run_worker(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "aftermovie._clip_worker", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _failure_reason(result: subprocess.CompletedProcess) -> str:
+    if result.stderr and result.stderr.strip():
+        return result.stderr.strip().splitlines()[-1]
+    return f"exit code {result.returncode}"
 
 
 def _even(n: int) -> int:
     return max(2, n - (n % 2))
 
 
-def _probe_clips(clip_paths: list[Path], skipped: list[str]) -> list[tuple[Path, str, int, int]]:
-    """Open every clip once (metadata only) to learn its orientation and size.
-    Clips that fail to open (corrupted, or the source folder syncing live via
-    OneDrive and briefly inconsistent) are logged to `skipped` and left out,
-    rather than crashing the whole build."""
+def _probe_clips(clip_paths: list[Path], skipped: list[str]) -> list[tuple[Path, str, int, int, float]]:
+    """Probe every clip's orientation/size/duration, each in its own isolated
+    subprocess. Some clips carry metadata that crashes moviepy's ffmpeg-output
+    parser outright (not a catchable exception) - isolating each probe keeps
+    one bad clip from taking down the whole run."""
     probed = []
     for path in clip_paths:
         try:
-            clip = VideoFileClip(str(path))
-        except Exception as exc:
-            skipped.append(f"{path.name} (failed to open while probing: {exc})")
+            result = _run_worker(["probe", str(path)], timeout=PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            skipped.append(f"{path.name} (timed out while probing)")
             continue
-        probed.append((path, clip_orientation(clip), clip.w, clip.h))
-        clip.close()
+        if result.returncode != 0:
+            skipped.append(f"{path.name} (failed to open while probing: {_failure_reason(result)})")
+            continue
+        w, h, orientation, duration = result.stdout.split()
+        probed.append((path, orientation, int(w), int(h), float(duration)))
     return probed
 
 
 def _order_clips(
-    probed: list[tuple[Path, str, int, int]],
+    probed: list[tuple[Path, str, int, int, float]],
     orientations: Optional[list[str]],
     order: str,
     seed: Optional[int],
@@ -83,10 +96,10 @@ def _order_clips(
         return paths  # sequential: already alphabetical, courtesy of find_clips()
 
     if not orientations:
-        return arrange([path for path, _, _, _ in probed])
+        return arrange([path for path, _, _, _, _ in probed])
 
     groups: dict[str, list[Path]] = {o: [] for o in orientations}
-    for path, o, _, _ in probed:
+    for path, o, _, _, _ in probed:
         if o in groups:
             groups[o].append(path)
 
@@ -94,18 +107,6 @@ def _order_clips(
     for o in orientations:
         ordered.extend(arrange(groups[o]))
     return ordered
-
-
-def _fit_to_canvas(clip, target_size: tuple[int, int]):
-    """Scale clip to fit inside target_size preserving aspect ratio, then
-    center it on a black canvas of exactly target_size (letterbox/pillarbox)."""
-    target_w, target_h = target_size
-    if clip.w / clip.h > target_w / target_h:
-        resized = clip.resized(width=target_w)
-    else:
-        resized = clip.resized(height=target_h)
-    resized = resized.with_position("center")
-    return CompositeVideoClip([resized], size=target_size, bg_color=(0, 0, 0))
 
 
 def build_aftermovie(
@@ -139,11 +140,13 @@ def build_aftermovie(
         # orientation-filtering) rather than every clip in the folder -
         # otherwise e.g. an all-portrait build gets sized against landscape
         # clips it never uses and everything ends up pillarboxed tiny.
-        dims = {path: (w, h) for path, _, w, h in probed}
+        dims = {path: (w, h) for path, _, w, h, _ in probed}
         used_dims = [dims[p] for p in clip_paths if p in dims]
         max_w = max((w for w, _ in used_dims), default=0)
         max_h = max((h for _, h in used_dims), default=0)
         target_size = (_even(max_w), _even(max_h))
+
+    durations = {path: dur for path, _, _, _, dur in probed}
 
     song_audio_clips = [AudioFileClip(str(song.path)) if song.path else None for song in songs]
     song_durations = [audio.duration if audio else float("inf") for audio in song_audio_clips]
@@ -156,19 +159,14 @@ def build_aftermovie(
             tmp_dir = Path(tmp_dir_str)
             segment_paths: list[Path] = []
 
-            # Render each clip's trimmed segment to its own small temp file and
-            # close the source clip right away, instead of keeping every clip's
-            # ffmpeg reader open at once for the whole build (that stops scaling
-            # once there are more than a couple dozen clips).
+            # Render each clip's trimmed segment in its own subprocess (see
+            # _clip_worker.py) and only keep the small temp file - never hold
+            # a clip's ffmpeg reader open in this process, and never let one
+            # clip's crash take the whole build down.
             for i, path in enumerate(clip_paths):
                 spec = manifest.get(path.name, ClipSpec())
                 beats = spec.beats if spec.beats is not None else default_beats
-
-                try:
-                    clip = VideoFileClip(str(path))
-                except Exception as exc:
-                    skipped.append(f"{path.name} (failed to open: {exc})")
-                    continue
+                duration = durations[path]
 
                 length_s = None
                 while song_idx < len(songs):
@@ -180,35 +178,43 @@ def build_aftermovie(
                     song_idx += 1
 
                 if length_s is None:
-                    clip.close()
                     dropped = len(clip_paths) - i
                     break  # every song's runtime is spoken for; nothing more fits
 
-                if clip.duration < length_s:
+                if duration < length_s:
                     skipped.append(
-                        f"{path.name} (needs {length_s * 1000:.0f}ms, has {clip.duration * 1000:.0f}ms)"
+                        f"{path.name} (needs {length_s * 1000:.0f}ms, has {duration * 1000:.0f}ms)"
                     )
-                    clip.close()
                     continue
 
                 if spec.start_ms is not None:
                     start_s = spec.start_ms / 1000
-                    if start_s + length_s > clip.duration:
-                        start_s = max(0.0, clip.duration - length_s)
+                    if start_s + length_s > duration:
+                        start_s = max(0.0, duration - length_s)
                 else:
-                    start_s = (clip.duration - length_s) / 2  # avoid shaky clip starts/ends
+                    start_s = (duration - length_s) / 2  # avoid shaky clip starts/ends
 
                 seg_path = tmp_dir / f"seg_{len(segment_paths):05d}.mp4"
                 rendered = False
                 try:
-                    sub = clip.subclipped(start_s, start_s + length_s)
-                    fitted = _fit_to_canvas(sub, target_size)
-                    fitted.write_videofile(str(seg_path), fps=fps, codec="libx264", audio=False, logger=None)
-                    rendered = True
-                except Exception as exc:
-                    skipped.append(f"{path.name} (failed to render at {start_s:.2f}s: {exc})")
-                finally:
-                    clip.close()
+                    result = _run_worker(
+                        [
+                            "render",
+                            str(path),
+                            str(start_s),
+                            str(length_s),
+                            str(target_size[0]),
+                            str(target_size[1]),
+                            str(fps),
+                            str(seg_path),
+                        ],
+                        timeout=RENDER_TIMEOUT_S,
+                    )
+                    rendered = result.returncode == 0 and seg_path.exists()
+                    if not rendered:
+                        skipped.append(f"{path.name} (failed to render at {start_s:.2f}s: {_failure_reason(result)})")
+                except subprocess.TimeoutExpired:
+                    skipped.append(f"{path.name} (timed out while rendering)")
 
                 if not rendered:
                     continue

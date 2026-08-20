@@ -41,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--beats-per-clip",
         type=int,
-        default=1,
-        help="Default number of beats each clip spans, unless overridden per-clip in --manifest (default: 1)",
+        default=2,
+        help="Default number of beats each clip spans, unless overridden per-clip in --manifest (default: 2)",
     )
     parser.add_argument(
         "--manifest",
