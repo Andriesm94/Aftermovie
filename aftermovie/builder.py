@@ -290,10 +290,14 @@ def build_aftermovie(
         # not the OS temp dir) - deep OS temp dirs turned out to be an
         # unreliable place to stage files right before ffmpeg reads them on
         # this machine, for whatever external reason.
+        # Absolute paths: ffmpeg's concat demuxer resolves relative entries
+        # relative to the list file's own directory, not the cwd - a
+        # relative cache_dir (the common case, e.g. "output/...") made every
+        # entry double up on itself (".../output/.../output/...").
         list_path = cache_dir / "concat_list.txt"
         with open(list_path, "w", encoding="utf-8") as f:
             for seg_path in segment_paths:
-                escaped = str(seg_path).replace("\\", "/").replace("'", "'\\''")
+                escaped = str(seg_path.resolve()).replace("\\", "/").replace("'", "'\\''")
                 f.write(f"file '{escaped}'\n")
 
         used_tracks = [
