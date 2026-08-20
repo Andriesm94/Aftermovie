@@ -1,6 +1,8 @@
 """Trim a folder of short clips to beat-multiple lengths and stitch them together."""
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 import subprocess
 import sys
@@ -19,6 +21,14 @@ from .manifest import ClipSpec, load_manifest
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 PROBE_TIMEOUT_S = 60
 RENDER_TIMEOUT_S = 300
+
+
+def _file_fingerprint(path: Path) -> str:
+    """Cheap content-change signal so a clip replaced with a new file (same
+    name, different bytes - e.g. a higher-quality re-export) doesn't reuse a
+    stale cached probe/segment."""
+    st = path.stat()
+    return f"{st.st_size}:{int(st.st_mtime)}"
 
 
 @dataclass
@@ -53,13 +63,33 @@ def _even(n: int) -> int:
     return max(2, n - (n % 2))
 
 
-def _probe_clips(clip_paths: list[Path], skipped: list[str]) -> list[tuple[Path, str, int, int, float]]:
+def _probe_clips(
+    clip_paths: list[Path], skipped: list[str], cache_dir: Optional[Path] = None
+) -> list[tuple[Path, str, int, int, float]]:
     """Probe every clip's orientation/size/duration, each in its own isolated
     subprocess. Some clips carry metadata that crashes moviepy's ffmpeg-output
     parser outright (not a catchable exception) - isolating each probe keeps
-    one bad clip from taking down the whole run."""
+    one bad clip from taking down the whole run. Results are cached to disk
+    (keyed by file size+mtime) so a build that gets interrupted partway
+    through - by anything, including something outside our control - doesn't
+    need to re-probe clips it already succeeded on when simply re-run."""
+    cache_path = cache_dir / "probe_cache.json" if cache_dir else None
+    cache: dict[str, list] = {}
+    if cache_path and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+
     probed = []
     for path in clip_paths:
+        cache_key = f"{path.name}:{_file_fingerprint(path)}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            w, h, orientation, duration = cached
+            probed.append((path, orientation, w, h, duration))
+            continue
+
         try:
             result = _run_worker(["probe", str(path)], timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
@@ -68,8 +98,17 @@ def _probe_clips(clip_paths: list[Path], skipped: list[str]) -> list[tuple[Path,
         if result.returncode != 0:
             skipped.append(f"{path.name} (failed to open while probing: {_failure_reason(result)})")
             continue
-        w, h, orientation, duration = result.stdout.split()
-        probed.append((path, orientation, int(w), int(h), float(duration)))
+
+        w_s, h_s, orientation, duration_s = result.stdout.split()
+        w, h, duration = int(w_s), int(h_s), float(duration_s)
+        probed.append((path, orientation, w, h, duration))
+
+        if cache_path:
+            # Written after every single probe, not batched at the end - the
+            # entire point is surviving an interruption partway through.
+            cache[cache_key] = [w, h, orientation, duration]
+            cache_path.write_text(json.dumps(cache))
+
     return probed
 
 
@@ -129,8 +168,17 @@ def build_aftermovie(
     manifest = load_manifest(manifest_path) if manifest_path else {}
     manifest_order = {name: idx for idx, name in enumerate(manifest.keys())}
 
+    # Persistent (not auto-deleted) cache tied to the output path, so that if
+    # the whole process gets killed partway through a long render - by
+    # anything, we've seen everything from a moviepy parsing crash to what
+    # looks like external interference on this machine - simply re-running
+    # the exact same command resumes from where it left off instead of
+    # redoing already-finished work from scratch.
+    cache_dir = output_path.parent / f".cache_{output_path.stem}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     skipped: list[str] = []
-    probed = _probe_clips(find_clips(clips_dir), skipped)
+    probed = _probe_clips(find_clips(clips_dir), skipped, cache_dir)
     clip_paths = _order_clips(probed, orientations, order, seed, manifest_order)
 
     if resolution:
@@ -160,9 +208,13 @@ def build_aftermovie(
             segment_paths: list[Path] = []
 
             # Render each clip's trimmed segment in its own subprocess (see
-            # _clip_worker.py) and only keep the small temp file - never hold
-            # a clip's ffmpeg reader open in this process, and never let one
-            # clip's crash take the whole build down.
+            # _clip_worker.py) and only keep the small file - never hold a
+            # clip's ffmpeg reader open in this process, and never let one
+            # clip's crash take the whole build down. Segments are written
+            # into the persistent cache_dir (not tmp_dir) under a name keyed
+            # by exactly what produced them, so a segment already rendered by
+            # an earlier, interrupted attempt at this same build is reused
+            # instead of redone.
             for i, path in enumerate(clip_paths):
                 spec = manifest.get(path.name, ClipSpec())
                 beats = spec.beats if spec.beats is not None else default_beats
@@ -194,27 +246,37 @@ def build_aftermovie(
                 else:
                     start_s = (duration - length_s) / 2  # avoid shaky clip starts/ends
 
-                seg_path = tmp_dir / f"seg_{len(segment_paths):05d}.mp4"
-                rendered = False
-                try:
-                    result = _run_worker(
-                        [
-                            "render",
-                            str(path),
-                            str(start_s),
-                            str(length_s),
-                            str(target_size[0]),
-                            str(target_size[1]),
-                            str(fps),
-                            str(seg_path),
-                        ],
-                        timeout=RENDER_TIMEOUT_S,
-                    )
-                    rendered = result.returncode == 0 and seg_path.exists()
-                    if not rendered:
-                        skipped.append(f"{path.name} (failed to render at {start_s:.2f}s: {_failure_reason(result)})")
-                except subprocess.TimeoutExpired:
-                    skipped.append(f"{path.name} (timed out while rendering)")
+                seg_key = hashlib.sha1(
+                    f"{path.name}|{_file_fingerprint(path)}|{start_s:.3f}|{length_s:.3f}|"
+                    f"{target_size[0]}x{target_size[1]}|{fps}".encode()
+                ).hexdigest()[:20]
+                seg_path = cache_dir / f"seg_{seg_key}.mp4"
+
+                if seg_path.exists():
+                    rendered = True
+                else:
+                    rendered = False
+                    try:
+                        result = _run_worker(
+                            [
+                                "render",
+                                str(path),
+                                str(start_s),
+                                str(length_s),
+                                str(target_size[0]),
+                                str(target_size[1]),
+                                str(fps),
+                                str(seg_path),
+                            ],
+                            timeout=RENDER_TIMEOUT_S,
+                        )
+                        rendered = result.returncode == 0 and seg_path.exists()
+                        if not rendered:
+                            skipped.append(
+                                f"{path.name} (failed to render at {start_s:.2f}s: {_failure_reason(result)})"
+                            )
+                    except subprocess.TimeoutExpired:
+                        skipped.append(f"{path.name} (timed out while rendering)")
 
                 if not rendered:
                     continue
