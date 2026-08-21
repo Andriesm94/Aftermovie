@@ -28,7 +28,10 @@ def load_manifest(path: Path) -> dict[str, ClipSpec]:
     data = json.loads(path.read_text())
     manifest: dict[str, ClipSpec] = {}
     for filename, entry in data.items():
-        manifest[filename] = ClipSpec(
+        # Keyed lowercase: Windows filenames are case-insensitive, and a
+        # clip's extension can change case (e.g. re-exported as .MOV) without
+        # the manifest entry being updated to match exactly.
+        manifest[filename.lower()] = ClipSpec(
             start_ms=entry.get("start_ms"),
             beats=entry.get("beats"),
         )

@@ -130,7 +130,7 @@ def _order_clips(
             rng.shuffle(paths)
             return paths
         if order == "manifest":
-            return sorted(paths, key=lambda p: manifest_order.get(p.name, len(manifest_order)))
+            return sorted(paths, key=lambda p: manifest_order.get(p.name.lower(), len(manifest_order)))
         return paths  # sequential: already alphabetical, courtesy of find_clips()
 
     if not orientations:
@@ -212,7 +212,7 @@ def build_aftermovie(
         # produced them, so a segment already rendered by an earlier,
         # interrupted attempt at this same build is reused instead of redone.
         for i, path in enumerate(clip_paths):
-            spec = manifest.get(path.name, ClipSpec())
+            spec = manifest.get(path.name.lower(), ClipSpec())
             beats = spec.beats if spec.beats is not None else default_beats
             duration = durations[path]
 
