@@ -20,6 +20,7 @@ from .manifest import ClipSpec, load_manifest
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 PROBE_TIMEOUT_S = 60
 RENDER_TIMEOUT_S = 300
+CONCAT_TIMEOUT_S = 600
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -203,6 +204,7 @@ def build_aftermovie(
 
     try:
         segment_paths: list[Path] = []
+        total_video_s = 0.0
 
         # Render each clip's trimmed segment in its own subprocess (see
         # _clip_worker.py) and only keep the small file - never hold a
@@ -216,18 +218,27 @@ def build_aftermovie(
             beats = spec.beats if spec.beats is not None else default_beats
             duration = durations[path]
 
-            length_s = None
-            while song_idx < len(songs):
-                candidate_length_s = (songs[song_idx].unit_ms * beats) / 1000
-                remaining_s = song_durations[song_idx] - song_elapsed_s[song_idx]
-                if candidate_length_s <= remaining_s:
-                    length_s = candidate_length_s
-                    break
-                song_idx += 1
+            if beats == -1:
+                # Take the whole clip regardless of remaining song runtime -
+                # if that runs the audio out early, the tail plays silent
+                # (see the apad step where the final track is built).
+                if song_idx >= len(songs):
+                    dropped = len(clip_paths) - i
+                    break  # no song left to attribute this segment's audio to
+                length_s = duration
+            else:
+                length_s = None
+                while song_idx < len(songs):
+                    candidate_length_s = (songs[song_idx].unit_ms * beats) / 1000
+                    remaining_s = song_durations[song_idx] - song_elapsed_s[song_idx]
+                    if candidate_length_s <= remaining_s:
+                        length_s = candidate_length_s
+                        break
+                    song_idx += 1
 
-            if length_s is None:
-                dropped = len(clip_paths) - i
-                break  # every song's runtime is spoken for; nothing more fits
+                if length_s is None:
+                    dropped = len(clip_paths) - i
+                    break  # every song's runtime is spoken for; nothing more fits
 
             if duration < length_s:
                 skipped.append(
@@ -279,6 +290,7 @@ def build_aftermovie(
 
             segment_paths.append(seg_path)
             song_elapsed_s[song_idx] += length_s
+            total_video_s += length_s
 
         if not segment_paths:
             reason = (
@@ -315,16 +327,29 @@ def build_aftermovie(
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
         if audio_path is not None:
+            # apad=whole_dur pads audio with silence up to an exact target
+            # duration (a no-op if it's already longer); -t then hard-trims
+            # the output to that same duration. Both bounds are known
+            # up-front from total_video_s, so ffmpeg never has to work out
+            # dynamically which stream is "shortest" - an open-ended `apad`
+            # (no whole_dur) combined with `-shortest` against a stream-copied
+            # concat-demuxer video measured in the hours, not seconds.
             cmd += [
                 "-i", str(audio_path),
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-shortest",
+                "-c:v", "copy",
+                "-af", f"apad=whole_dur={total_video_s:.3f}",
+                "-c:a", "aac",
+                "-t", f"{total_video_s:.3f}",
             ]
         else:
             cmd += ["-map", "0:v:0", "-c:v", "copy"]
         cmd += [str(output_path)]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=CONCAT_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"ffmpeg timed out joining segments after {CONCAT_TIMEOUT_S}s") from exc
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg failed to join segments:\n{result.stderr[-4000:]}")
     finally:
