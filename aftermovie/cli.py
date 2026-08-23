@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         help="Output canvas size as WIDTHxHEIGHT, e.g. 1920x1080. Clips are letterboxed/pillarboxed to fit "
         "without cropping. Default: the largest width and largest height found among the clips actually used.",
     )
+    parser.add_argument(
+        "--continue-without-audio",
+        action="store_true",
+        help="If the song(s) run out before the clips do, keep playing the remaining clips (at the last "
+        "song's pace) with the tail silent, instead of dropping them.",
+    )
     return parser.parse_args()
 
 
@@ -109,6 +115,7 @@ def main() -> None:
         fps=args.fps,
         orientations=args.orientation,
         resolution=args.resolution,
+        continue_without_audio=args.continue_without_audio,
     )
     print(f"Done: {args.output}")
 

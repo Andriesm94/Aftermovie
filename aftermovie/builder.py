@@ -159,6 +159,7 @@ def build_aftermovie(
     fps: int = 30,
     orientations: Optional[list[str]] = None,
     resolution: Optional[tuple[int, int]] = None,
+    continue_without_audio: bool = False,
 ) -> None:
     if not songs:
         raise ValueError("At least one song (or a manual --bpm/--ms) is required.")
@@ -222,7 +223,7 @@ def build_aftermovie(
                 # Take the whole clip regardless of remaining song runtime -
                 # if that runs the audio out early, the tail plays silent
                 # (see the apad step where the final track is built).
-                if song_idx >= len(songs):
+                if song_idx >= len(songs) and not continue_without_audio:
                     dropped = len(clip_paths) - i
                     break  # no song left to attribute this segment's audio to
                 length_s = duration
@@ -237,8 +238,13 @@ def build_aftermovie(
                     song_idx += 1
 
                 if length_s is None:
-                    dropped = len(clip_paths) - i
-                    break  # every song's runtime is spoken for; nothing more fits
+                    if continue_without_audio:
+                        # Every song is spoken for - keep going at the last
+                        # song's pace, just without any audio backing it.
+                        length_s = (songs[-1].unit_ms * beats) / 1000
+                    else:
+                        dropped = len(clip_paths) - i
+                        break  # every song's runtime is spoken for; nothing more fits
 
             if duration < length_s:
                 skipped.append(
@@ -289,7 +295,8 @@ def build_aftermovie(
                 continue
 
             segment_paths.append(seg_path)
-            song_elapsed_s[song_idx] += length_s
+            if song_idx < len(songs):
+                song_elapsed_s[song_idx] += length_s
             total_video_s += length_s
 
         if not segment_paths:
