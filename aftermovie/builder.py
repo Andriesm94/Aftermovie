@@ -19,7 +19,7 @@ from .manifest import ClipSpec, load_manifest
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 PROBE_TIMEOUT_S = 60
-RENDER_TIMEOUT_S = 300
+RENDER_TIMEOUT_S = 900  # long/HQ segments (e.g. many beats at a large auto-detected canvas) can legitimately need this
 CONCAT_TIMEOUT_S = 600
 
 
